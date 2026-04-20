@@ -19,6 +19,7 @@ from megatron.bridge.models.bailing import (
 from megatron.bridge.models.conversion.auto_bridge import AutoBridge
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+from megatron.bridge.models.param2moe import Param2MoEBridge
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     ColumnParallelMapping,
@@ -148,6 +149,7 @@ from megatron.bridge.models.sarvam import (
 )
 from megatron.bridge.models.t5_provider import T5ModelProvider
 
+from megatron.bridge.models.param2moe import Param2MoEBridge
 
 __all__ = [
     "AutoBridge",

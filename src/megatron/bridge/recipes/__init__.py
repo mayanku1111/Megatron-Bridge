@@ -36,3 +36,5 @@ from megatron.bridge.recipes.olmoe import *
 from megatron.bridge.recipes.qwen import *
 from megatron.bridge.recipes.qwen2_audio import *
 from megatron.bridge.recipes.qwen_vl import *
+
+from megatron.bridge.recipes.param2moe import param2_17b_pretrain_config
