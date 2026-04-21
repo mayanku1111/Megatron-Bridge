@@ -35,40 +35,53 @@ except (ImportError, ModuleNotFoundError):
     HAVE_TE = False
 
 
+# ── Primary registration: Param2MoEForCausalLM (HF Thinking model) ───────────
+# source is a string because this is a trust_remote_code model —
+# it cannot be imported directly at module load time.
 @MegatronModelBridge.register_bridge(
-    source="BailingMoeV2ForCausalLM",
+    source="Param2MoEForCausalLM",
     target=GPTModel,
     provider=Param2MoEModelProvider,
     model_type="param2moe",
 )
 class Param2MoEBridge(MegatronModelBridge):
     """
-    Megatron Bridge for Param2MoE (bharatgenai/Param2-17B-A2.4B-Thinking).
+    Megatron Bridge for the Param2MoE / BailingMoeV2 architecture family.
+
+    Handles two HuggingFace architecture class names that share the same
+    underlying architecture:
+      - "Param2MoEForCausalLM"    (bharatgenai/Param2-17B-A2.4B-Thinking)
+      - "BailingMoeV2ForCausalLM" (local NeMo pretrain checkpoint)
 
     Architecture:
       - 21 layers: 1 dense (layer 0) + 20 MoE
-      - Standard GQA: 32Q / 8KV heads, head_dim=64  ← NOT MLA
+      - Standard GQA: 32Q / 8KV heads, head_dim=64  (NOT MLA)
       - 64 routed experts + 2 shared experts, top-6 sigmoid routing
-      - QK-Norm (q_norm / k_norm per head)
-      - Tied embeddings (tie_word_embeddings=True)
+      - QK-Norm per head (q_norm / k_norm)
+      - Tied embeddings, vocab_size=128000
 
     Example:
         >>> from megatron.bridge import AutoBridge
+        >>> # Works for both architecture names:
         >>> bridge = AutoBridge.from_hf_pretrained(
         ...     "bharatgenai/Param2-17B-A2.4B-Thinking",
         ...     trust_remote_code=True,
         ... )
-        >>> provider = bridge.to_megatron_provider()
+        >>> bridge = AutoBridge.from_hf_pretrained(
+        ...     "/path/to/local/bailing_moe_checkpoint",
+        ...     trust_remote_code=True,
+        ... )
     """
 
     def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> Param2MoEModelProvider:
-        """Translate HuggingFace Param2MoEConfig → Param2MoEModelProvider."""
-        # super() reads all fields declared in MegatronModelBridge.CONFIG_MAPPING
-        # (num_layers, hidden_size, ffn_hidden_size, num_attention_heads,
-        #  num_query_groups, kv_channels, rotary_base, vocab_size, …)
-        # and populates them automatically from hf_pretrained.config.
-        provider = super().provider_bridge(hf_pretrained)
-        hf_config = hf_pretrained.config
+        """Translate HuggingFace config → Param2MoEModelProvider.
+
+        super().provider_bridge() auto-reads from CONFIG_MAPPING:
+          num_layers, hidden_size, ffn_hidden_size, num_attention_heads,
+          num_query_groups, kv_channels, rotary_base, vocab_size, layernorm_epsilon, ...
+        """
+        provider   = super().provider_bridge(hf_pretrained)
+        hf_config  = hf_pretrained.config
 
         # ── Layer spec ────────────────────────────────────────────────────────
         provider.transformer_layer_spec = partial(
@@ -76,57 +89,56 @@ class Param2MoEBridge(MegatronModelBridge):
         )
 
         # ── Attention ─────────────────────────────────────────────────────────
-        provider.normalization = "RMSNorm"
+        provider.normalization    = "RMSNorm"
         provider.gated_linear_unit = True
-        provider.add_bias_linear = False
-        provider.add_qkv_bias = False
-        provider.qk_layernorm = hf_config.use_qk_norm                  # True
+        provider.add_bias_linear  = False
+        provider.add_qkv_bias     = False
+        provider.qk_layernorm     = hf_config.use_qk_norm          # True
         provider.share_embeddings_and_output_weights = (
-            hf_config.tie_word_embeddings                               # True
+            hf_config.tie_word_embeddings                           # True
         )
-        provider.hidden_dropout = hf_config.embedding_dropout           # 0.0
-        provider.attention_dropout = hf_config.attention_dropout        # 0.0
+        provider.hidden_dropout   = hf_config.embedding_dropout    # 0.0
+        provider.attention_dropout = hf_config.attention_dropout   # 0.0
         provider.attention_softmax_in_fp32 = False
         provider.apply_rope_fusion = False
 
         # ── MoE router ────────────────────────────────────────────────────────
-        provider.moe_token_dispatcher_type = "alltoall"
-        # sigmoid router: moe_router_pre_softmax MUST be False
-        provider.moe_router_pre_softmax = False
-        provider.moe_router_score_function = "sigmoid"
+        provider.moe_token_dispatcher_type    = "alltoall"
+        provider.moe_router_pre_softmax       = False   # sigmoid: no pre-softmax
+        provider.moe_router_score_function    = "sigmoid"
         provider.moe_router_enable_expert_bias = (
-            hf_config.moe_router_enable_expert_bias                     # True
+            hf_config.moe_router_enable_expert_bias                # True
         )
-        provider.moe_router_dtype = getattr(hf_config, "router_dtype", "fp32")
+        provider.moe_router_dtype             = getattr(hf_config, "router_dtype", "fp32")
         provider.moe_router_load_balancing_type = "seq_aux_loss"
-        provider.moe_shared_expert_overlap = True
-        provider.moe_grouped_gemm = True
-        provider.moe_permute_fusion = True
+        provider.moe_shared_expert_overlap    = True
+        provider.moe_grouped_gemm             = True
+        provider.moe_permute_fusion           = True
 
         # ── Fusion flags ──────────────────────────────────────────────────────
         provider.gradient_accumulation_fusion = True
-        provider.bias_activation_fusion = True
-        provider.bias_dropout_fusion = True
-        provider.cross_entropy_loss_fusion = True
-        provider.cross_entropy_fusion_impl = "te"
-        provider.masked_softmax_fusion = True
-        provider.persist_layer_norm = True
+        provider.bias_activation_fusion       = True
+        provider.bias_dropout_fusion          = True
+        provider.cross_entropy_loss_fusion    = True
+        provider.cross_entropy_fusion_impl    = "te"
+        provider.masked_softmax_fusion        = True
+        provider.persist_layer_norm           = True
 
         # ── MoE layer frequency ───────────────────────────────────────────────
-        # 0 = dense FFN,  1 = MoE FFN
-        # Layer 0 is dense (first_k_dense_replace=1), layers 1-20 are MoE.
-        first_k_dense = hf_config.first_k_dense_replace                # 1
-        num_layers    = hf_config.num_hidden_layers                     # 21
+        # 0 = dense FFN, 1 = MoE FFN
+        # Layer 0 is dense, layers 1-20 are MoE (first_k_dense_replace=1)
+        first_k_dense = hf_config.first_k_dense_replace            # 1
+        num_layers    = hf_config.num_hidden_layers                 # 21
         provider.moe_layer_freq = (
             [0] * first_k_dense + [1] * (num_layers - first_k_dense)
         )
 
         # ── Shared expert total intermediate size ─────────────────────────────
-        # MCore wants the *total* size across all shared experts:
-        #   per-expert size (4096) × num_shared_experts (2) = 8192
+        # MCore wants total size across all shared experts:
+        #   per-expert (4096) × num_shared (2) = 8192
         provider.moe_shared_expert_intermediate_size = (
-            hf_config.moe_shared_expert_intermediate_size               # 4096
-            * hf_config.num_shared_experts                             # × 2
+            hf_config.moe_shared_expert_intermediate_size          # 4096
+            * hf_config.num_shared_experts                         # × 2
         )
 
         return provider
@@ -147,53 +159,41 @@ class Param2MoEBridge(MegatronModelBridge):
         shared_total = getattr(provider, "moe_shared_expert_intermediate_size", None)
         num_shared   = getattr(provider, "num_shared_experts", None)
         if shared_total and num_shared:
-            hf_cfg["moe_shared_expert_intermediate_size"] = (
-                shared_total // num_shared
-            )
+            hf_cfg["moe_shared_expert_intermediate_size"] = shared_total // num_shared
 
-        # Param2-specific fields not covered by the base CONFIG_MAPPING
-        hf_cfg["score_function"]            = "sigmoid"
-        hf_cfg["norm_topk_prob"]            = True
-        hf_cfg["n_group"]                   = 1
-        hf_cfg["topk_group"]                = 1
-        hf_cfg["num_nextn_predict_layers"]  = 0
-        hf_cfg["mtp_loss_scaling_factor"]   = 0
-        hf_cfg["partial_rotary_factor"]     = 1.0
-        hf_cfg["use_qkv_bias"]              = False
-        hf_cfg["use_bias"]                  = False
-        hf_cfg["use_rmsnorm"]               = True
+        # Param2-specific fields not in base CONFIG_MAPPING
+        hf_cfg["score_function"]           = "sigmoid"
+        hf_cfg["norm_topk_prob"]           = True
+        hf_cfg["n_group"]                  = 1
+        hf_cfg["topk_group"]               = 1
+        hf_cfg["num_nextn_predict_layers"] = 0
+        hf_cfg["mtp_loss_scaling_factor"]  = 0
+        hf_cfg["partial_rotary_factor"]    = 1.0
+        hf_cfg["use_qkv_bias"]             = False
+        hf_cfg["use_bias"]                 = False
+        hf_cfg["use_rmsnorm"]              = True
 
         return hf_cfg
 
     def mapping_registry(self) -> MegatronMappingRegistry:
         """
-        Full parameter mapping: Megatron Core names ↔ HuggingFace Param2MoE names.
+        Full parameter mapping: Megatron Core names ↔ HuggingFace names.
 
-        Notes
-        -----
-        * AutoMapping(megatron_param=..., hf_param=...)
-            General 1:1 mapping.  AutoMapping auto-detects whether the weight
-            is ColumnParallel, RowParallel, or Replicated from the layer type.
+        This mapping is IDENTICAL for both Param2MoEForCausalLM and
+        BailingMoeV2ForCausalLM — they share the same weight key naming
+        convention (model.layers.*.self_attn.q_proj.weight, etc.).
 
-        * QKVMapping(megatron_param=..., q=..., k=..., v=...)
-            Fuses the three separate HF projections into MCore's packed
-            linear_qkv.weight, handling GQA interleaving and TP splitting.
-
-        * GatedMLPMapping(megatron_param=..., gate=..., up=...)
-            Concatenates gate_proj + up_proj → linear_fc1 [G; U] for SwiGLU,
-            with correct TP splitting (each rank gets [gate_shard; up_shard]).
-
-        Param2-specific weight names vs. DeepSeek:
-          - NO MLA projections (q_a_proj, kv_a_proj, etc.) — use standard GQA
-          - QK-Norm: self_attn.q_norm / k_norm → q_layernorm / k_layernorm
-          - expert bias: mlp.gate.e_score_correction_bias → mlp.router.expert_bias
+        Mapping types used:
+          QKVMapping      — fuses q/k/v → linear_qkv (handles GQA interleaving + TP)
+          GatedMLPMapping — fuses gate+up → linear_fc1 [G;U] (handles TP splitting)
+          AutoMapping     — 1:1, auto-detects ColumnParallel/RowParallel/Replicated
         """
         # ── 1:1 AutoMappings ─────────────────────────────────────────────────
         param_mappings = {
             # Embedding
             "embedding.word_embeddings.weight":
                 "model.embed_tokens.weight",
-            # Final norm + output
+            # Final norm + output head
             "decoder.final_layernorm.weight":
                 "model.norm.weight",
             "output_layer.weight":
@@ -204,29 +204,29 @@ class Param2MoEBridge(MegatronModelBridge):
             # Attention output projection
             "decoder.layers.*.self_attention.linear_proj.weight":
                 "model.layers.*.self_attn.o_proj.weight",
-            # QK-Norm (Param2-specific: per-head RMSNorm on Q and K)
+            # QK-Norm (Param2/BailingMoE specific: per-head RMSNorm on Q and K)
             "decoder.layers.*.self_attention.q_layernorm.weight":
                 "model.layers.*.self_attn.q_norm.weight",
             "decoder.layers.*.self_attention.k_layernorm.weight":
                 "model.layers.*.self_attn.k_norm.weight",
-            # Pre-MLP layernorm — MoE layers use pre_mlp_layernorm,
-            # dense layer uses mlp.linear_fc1.layer_norm_weight.
+            # Pre-MLP layernorm
+            # MoE layers  → pre_mlp_layernorm (separate module in MCore)
+            # Dense layer → mlp.linear_fc1.layer_norm_weight (fused in TE)
             # Both map to the same HF key; MCore resolves by module presence.
             "decoder.layers.*.pre_mlp_layernorm.weight":
                 "model.layers.*.post_attention_layernorm.weight",
             "decoder.layers.*.mlp.linear_fc1.layer_norm_weight":
                 "model.layers.*.post_attention_layernorm.weight",
-            # Dense FFN output (layer 0 only)
+            # Dense FFN down-projection (layer 0 only)
             "decoder.layers.*.mlp.linear_fc2.weight":
                 "model.layers.*.mlp.down_proj.weight",
-            # MoE router
+            # MoE router weight
             "decoder.layers.*.mlp.router.weight":
                 "model.layers.*.mlp.gate.weight",
-            # Expert bias correction (sigmoid router with bias — DeepSeek-V3 style)
+            # Expert bias correction (sigmoid router, DeepSeek-V3 style)
             "decoder.layers.*.mlp.router.expert_bias":
                 "model.layers.*.mlp.gate.e_score_correction_bias",
-            # Routed expert down-projections
-            # The trailing * in the megatron_param matches expert indices for EP
+            # Routed expert down-projections (* matches expert index for EP)
             "decoder.layers.*.mlp.experts.linear_fc2.weight*":
                 "model.layers.*.mlp.experts.*.down_proj.weight",
             # Shared expert down-projection
@@ -249,21 +249,21 @@ class Param2MoEBridge(MegatronModelBridge):
             )
         )
 
-        # ── GatedMLP (SwiGLU: [gate; up] → linear_fc1) ──────────────────────
+        # ── GatedMLP: [gate; up] → linear_fc1 for SwiGLU ────────────────────
         mapping_list.extend([
-            # Dense layer 0: standard FFN gate/up
+            # Dense layer 0
             GatedMLPMapping(
                 megatron_param="decoder.layers.*.mlp.linear_fc1.weight",
                 gate="model.layers.*.mlp.gate_proj.weight",
                 up="model.layers.*.mlp.up_proj.weight",
             ),
-            # Routed experts: * wildcard matches the expert index
+            # Routed experts (* wildcard = expert index)
             GatedMLPMapping(
                 megatron_param="decoder.layers.*.mlp.experts.linear_fc1.weight*",
                 gate="model.layers.*.mlp.experts.*.gate_proj.weight",
                 up="model.layers.*.mlp.experts.*.up_proj.weight",
             ),
-            # Shared experts (always-active, 2 experts fused into one module)
+            # Shared experts
             GatedMLPMapping(
                 megatron_param="decoder.layers.*.mlp.shared_experts.linear_fc1.weight",
                 gate="model.layers.*.mlp.shared_experts.gate_proj.weight",
@@ -272,3 +272,20 @@ class Param2MoEBridge(MegatronModelBridge):
         ])
 
         return MegatronMappingRegistry(*mapping_list)
+
+
+# ── Secondary registration: BailingMoeV2ForCausalLM ──────────────────────────
+# Same class, same bridge logic, different architecture name.
+# Applying the decorator as a plain function call registers the SAME class
+# under a second name — no subclass, no code duplication.
+#
+# This handles:
+#   - Local NeMo checkpoint: config.json has "BailingMoeV2ForCausalLM"
+#   - HF Thinking model:     config.json has "Param2MoEForCausalLM"
+# Both are the same architecture, same weight layout, same mapping.
+MegatronModelBridge.register_bridge(
+    source="BailingMoeV2ForCausalLM",
+    target=GPTModel,
+    provider=Param2MoEModelProvider,
+    model_type="param2moe",
+)(Param2MoEBridge)
